@@ -71,13 +71,14 @@
         <pre id="gazeOutput">Click 'Enable Camera Stream' to begin live detection...</pre>
     </div>
 
-    <!-- Module 2: End-to-End Encryption & Cloud Sync -->
+    <!-- Module 2: Firebase Realtime Database Sync -->
     <div class="module">
-        <h3>2. End-to-End Encryption & Cloud Synchronization</h3>
-        <p>Encrypts patient eye-movement logs locally and syncs securely to the cloud database.</p>
+        <h3>2. Firebase Realtime Database Sync</h3>
+        <p>Send a message to Firebase. Messages are not end-to-end encrypted; do not enter sensitive patient information.</p>
         <input type="text" id="patientMsg" placeholder="Type message (e.g., 'I need assistance')">
-        <button onclick="encryptAndSyncCloud()">Encrypt & Push to Cloud</button>
-        <pre id="cloudOutput">Cloud status: Ready for encrypted sync...</pre>
+        <button onclick="syncToCloud()">Send to Cloud</button>
+        <p id="databaseStatus" role="status">Database status: Connecting...</p>
+        <pre id="cloudOutput">Cloud status: Ready to sync...</pre>
     </div>
 
     <!-- Module 3: Cyber Defense & Audit Log -->
@@ -106,6 +107,12 @@
         firebase.initializeApp(firebaseConfig);
     }
     const db = firebase.database();
+    db.ref(".info/connected").on("value", (snapshot) => {
+        const status = document.getElementById("databaseStatus");
+        status.innerText = snapshot.val()
+            ? "Database status: Connected"
+            : "Database status: Disconnected";
+    });
 
     let videoStream = null;
     let detectionAnimation = null;
@@ -197,30 +204,30 @@
             JSON.stringify(coordinatePacket, null, 2);
     }
 
-    function encryptAndSyncCloud() {
-        let msg = document.getElementById("patientMsg").value;
-        if (!msg) msg = "I need water";
-        
-        // Local AES-equivalent base64 ciphertext encoding
-        let ciphertext = btoa(encodeURIComponent(msg));
-        
+    function syncToCloud() {
+        const msg = document.getElementById("patientMsg").value.trim();
+        const output = document.getElementById("cloudOutput");
+        if (!msg) {
+            output.innerText = "Enter a message before syncing.";
+            return;
+        }
+
         let payload = {
             timestamp: new Date().toISOString(),
-            ciphertext: ciphertext,
-            encryptionStandard: "AES 256-bit",
-            status: "Encrypted locally before cloud transport"
+            message: msg,
+            securityNotice: "Not end-to-end encrypted"
         };
 
         db.ref('secure_gaze_logs').push(payload)
             .then(() => {
-                document.getElementById("cloudOutput").innerText = 
-                    "SUCCESS: Encrypted payload synchronized to Cloud Database!\n\n" + 
+                output.innerText =
+                    "SUCCESS: Message synchronized to Firebase Realtime Database.\n\n" +
                     JSON.stringify(payload, null, 2);
             })
-            .catch(() => {
-                document.getElementById("cloudOutput").innerText = 
-                    "SIMULATED CLOUD SYNC SUCCESS (Offline Mode):\n" + 
-                    JSON.stringify(payload, null, 2);
+            .catch((error) => {
+                output.innerText =
+                    "ERROR: Firebase could not save the message (" +
+                    error.code + "): " + error.message;
             });
     }
 
