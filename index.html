@@ -73,12 +73,22 @@
 
     <!-- Module 2: Firebase Realtime Database Sync -->
     <div class="module">
-        <h3>2. Firebase Realtime Database Sync</h3>
-        <p>Send a message to Firebase. Messages are not end-to-end encrypted; do not enter sensitive patient information.</p>
-        <input type="text" id="patientMsg" placeholder="Type message (e.g., 'I need assistance')">
-        <button onclick="syncToCloud()">Send to Cloud</button>
+        <h3>2. End-to-End Encrypted Patient Messages</h3>
+        <p>Messages and timestamps are end-to-end encrypted in this browser with AES-256-GCM before being sent to Firebase, and can only be decrypted with the passphrase. Firebase never receives the passphrase or plaintext. Use a strong passphrase of at least 12 characters and keep it private; if lost, the message cannot be recovered. Firebase record IDs remain visible. Prototype only: use sample data, not real patient information.</p>
+        <label for="patientMsg">Patient message</label><br>
+        <input type="text" id="patientMsg" placeholder="Type a sample message">
+        <br><br>
+        <label for="encryptionPassphrase">Encryption passphrase (at least 12 characters)</label><br>
+        <input type="password" id="encryptionPassphrase" minlength="12" autocomplete="new-password" placeholder="Enter a strong passphrase">
+        <br>
+        <button onclick="encryptAndSave()">Encrypt & Save</button>
+        <hr>
+        <label for="recordId">Firebase record ID</label><br>
+        <input type="text" id="recordId" placeholder="Paste the record ID shown after saving">
+        <button onclick="loadAndDecrypt()">Load & Decrypt</button>
         <p id="databaseStatus" role="status">Database status: Connecting...</p>
         <pre id="cloudOutput">Cloud status: Ready to sync...</pre>
+        <pre id="decryptedOutput" aria-live="polite"></pre>
     </div>
 
     <!-- Module 3: Cyber Defense & Audit Log -->
@@ -107,6 +117,9 @@
         firebase.initializeApp(firebaseConfig);
     }
     const db = firebase.database();
+    const encryptionIterations = 310000;
+    const encryptionContext = new TextEncoder().encode("patient-message:v1");
+
     db.ref(".info/connected").on("value", (snapshot) => {
         const status = document.getElementById("databaseStatus");
         status.innerText = snapshot.val()
@@ -204,31 +217,151 @@
             JSON.stringify(coordinatePacket, null, 2);
     }
 
-    function syncToCloud() {
+    function bytesToBase64(bytes) {
+        let binary = "";
+        bytes.forEach((byte) => {
+            binary += String.fromCharCode(byte);
+        });
+        return btoa(binary);
+    }
+
+    function base64ToBytes(value) {
+        const binary = atob(value);
+        return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    }
+
+    async function deriveEncryptionKey(passphrase, salt) {
+        const material = await crypto.subtle.importKey(
+            "raw",
+            new TextEncoder().encode(passphrase),
+            "PBKDF2",
+            false,
+            ["deriveKey"]
+        );
+        return crypto.subtle.deriveKey(
+            { name: "PBKDF2", hash: "SHA-256", salt, iterations: encryptionIterations },
+            material,
+            { name: "AES-GCM", length: 256 },
+            false,
+            ["encrypt", "decrypt"]
+        );
+    }
+
+    async function encryptPatientMessage(message, passphrase) {
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const key = await deriveEncryptionKey(passphrase, salt);
+        const plaintext = new TextEncoder().encode(JSON.stringify({
+            message,
+            timestamp: new Date().toISOString()
+        }));
+        const ciphertext = await crypto.subtle.encrypt(
+            { name: "AES-GCM", iv, additionalData: encryptionContext, tagLength: 128 },
+            key,
+            plaintext
+        );
+
+        return {
+            schemaVersion: 1,
+            algorithm: "AES-256-GCM",
+            keyDerivation: "PBKDF2-SHA-256",
+            iterations: encryptionIterations,
+            salt: bytesToBase64(salt),
+            iv: bytesToBase64(iv),
+            ciphertext: bytesToBase64(new Uint8Array(ciphertext))
+        };
+    }
+
+    async function decryptPatientMessage(record, passphrase) {
+        if (
+            !record ||
+            record.schemaVersion !== 1 ||
+            record.algorithm !== "AES-256-GCM" ||
+            record.keyDerivation !== "PBKDF2-SHA-256" ||
+            record.iterations !== encryptionIterations ||
+            typeof record.salt !== "string" ||
+            typeof record.iv !== "string" ||
+            typeof record.ciphertext !== "string"
+        ) {
+            throw new Error("This is not a supported encrypted record.");
+        }
+
+        const key = await deriveEncryptionKey(passphrase, base64ToBytes(record.salt));
+        const plaintext = await crypto.subtle.decrypt(
+            {
+                name: "AES-GCM",
+                iv: base64ToBytes(record.iv),
+                additionalData: encryptionContext,
+                tagLength: 128
+            },
+            key,
+            base64ToBytes(record.ciphertext)
+        );
+        return JSON.parse(new TextDecoder().decode(plaintext));
+    }
+
+    async function encryptAndSave() {
         const msg = document.getElementById("patientMsg").value.trim();
+        const passphrase = document.getElementById("encryptionPassphrase").value;
         const output = document.getElementById("cloudOutput");
+        const decryptedOutput = document.getElementById("decryptedOutput");
+        decryptedOutput.innerText = "";
         if (!msg) {
             output.innerText = "Enter a message before syncing.";
             return;
         }
+        if (passphrase.length < 12) {
+            output.innerText = "Use an encryption passphrase of at least 12 characters.";
+            return;
+        }
 
-        let payload = {
-            timestamp: new Date().toISOString(),
-            message: msg,
-            securityNotice: "Not end-to-end encrypted"
-        };
+        output.innerText = "Encrypting message locally...";
+        try {
+            const encryptedRecord = await encryptPatientMessage(msg, passphrase);
+            const recordRef = db.ref("secure_gaze_logs").push();
+            await recordRef.set(encryptedRecord);
+            document.getElementById("recordId").value = recordRef.key;
+            document.getElementById("patientMsg").value = "";
+            output.innerText =
+                "SUCCESS: Encrypted record saved. Keep this record ID and passphrase to decrypt it.\n\n" +
+                "Firebase record ID: " + recordRef.key + "\n\n" +
+                JSON.stringify(encryptedRecord, null, 2);
+        } catch (error) {
+            output.innerText = "ERROR: Could not encrypt or save the message: " + error.message;
+        }
+    }
 
-        db.ref('secure_gaze_logs').push(payload)
-            .then(() => {
-                output.innerText =
-                    "SUCCESS: Message synchronized to Firebase Realtime Database.\n\n" +
-                    JSON.stringify(payload, null, 2);
-            })
-            .catch((error) => {
-                output.innerText =
-                    "ERROR: Firebase could not save the message (" +
-                    error.code + "): " + error.message;
-            });
+    async function loadAndDecrypt() {
+        const recordId = document.getElementById("recordId").value.trim();
+        const passphrase = document.getElementById("encryptionPassphrase").value;
+        const output = document.getElementById("cloudOutput");
+        const decryptedOutput = document.getElementById("decryptedOutput");
+        decryptedOutput.innerText = "";
+
+        if (!/^[A-Za-z0-9_-]{1,128}$/.test(recordId)) {
+            output.innerText = "Enter a valid Firebase record ID.";
+            return;
+        }
+        if (!passphrase) {
+            output.innerText = "Enter the passphrase used when this record was encrypted.";
+            return;
+        }
+
+        output.innerText = "Loading encrypted record...";
+        try {
+            const snapshot = await db.ref("secure_gaze_logs/" + recordId).once("value");
+            if (!snapshot.exists()) {
+                output.innerText = "No record found with that ID.";
+                return;
+            }
+            const decrypted = await decryptPatientMessage(snapshot.val(), passphrase);
+            output.innerText = "SUCCESS: Record loaded and decrypted locally.";
+            decryptedOutput.innerText = JSON.stringify(decrypted, null, 2);
+        } catch (error) {
+            output.innerText =
+                "ERROR: Could not load or decrypt the record. Check your passphrase, record ID, and database read permissions. (" +
+                error.message + ")";
+        }
     }
 
     function simulateAttack() {
