@@ -2,6 +2,8 @@
 
 An **IoMT (Internet of Medical Things)** and **patient privacy**-focused eye-monitoring web prototype designed to assist individuals with severe motor impairments, such as paralysis and Amyotrophic Lateral Sclerosis (ALS). Built with client-side security controls, local visual privacy masking, and encrypted Firebase cloud synchronization.
 
+> **Disclaimer:** This project is an academic proof-of-concept prototype created for research and demonstration purposes. It is **not** a clinically certified medical device and should not be used for clinical diagnosis, treatment, or life-critical monitoring.
+
 ## Live Demo
 Access the deployed web application directly in your browser:  
 **[Launch Live Prototype](https://cosmosfemme.github.io/securing-eye-monitor-accessibility-technology/)**
