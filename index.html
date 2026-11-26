@@ -35,6 +35,7 @@
             width: 100%;
             height: 100%;
             object-fit: cover;
+            visibility: hidden;
         }
         .video-container canvas {
             position: absolute;
@@ -43,6 +44,16 @@
             width: 100%;
             height: 100%;
             pointer-events: none;
+        }
+        #maskedFramePreview {
+            display: block;
+            max-width: 100%;
+            height: auto;
+            margin-top: 12px;
+            border-radius: 6px;
+        }
+        #maskedFramePreview[hidden] {
+            display: none;
         }
     </style>
 
@@ -59,7 +70,7 @@
     <!-- Module 1: Live Webcam & Interactive Detection Overlay -->
     <div class="module">
         <h3>1. Live Webcam Feed & Local Gaze Coordinate Stream</h3>
-        <p>Accesses device camera to capture real-time movement with live ocular detection overlay while stripping raw hardware metadata locally.</p>
+        <p>The live camera preview is pixelated in-browser for privacy. Capture and download only the masked frame; raw video is not saved or sent to Firebase.</p>
         
         <div class="video-container">
             <video id="webcamVideo" autoplay playsinline muted></video>
@@ -68,13 +79,17 @@
 
         <button onclick="startWebcam()">Enable Camera Stream</button>
         <button onclick="captureCoordinatePacket()">Capture Live Coordinate Packet</button>
+        <button onclick="captureMaskedFrame()">Capture Masked Frame</button>
+        <p id="videoPrivacyStatus" role="status">Privacy mask: enabled (full-frame pixelation)</p>
+        <img id="maskedFramePreview" alt="Captured pixelated camera frame" hidden>
+        <p><a id="downloadMaskedFrame" download="masked-camera-frame.png" hidden>Download masked frame</a></p>
         <pre id="gazeOutput">Click 'Enable Camera Stream' to begin live detection...</pre>
     </div>
 
     <!-- Module 2: Firebase Realtime Database Sync -->
     <div class="module">
         <h3>2. End-to-End Encrypted Patient Messages</h3>
-        <p>Messages and timestamps are end-to-end encrypted in this browser with AES-256-GCM before being sent to Firebase, and can only be decrypted with the passphrase. Firebase never receives the passphrase or plaintext. Use a strong passphrase of at least 12 characters and keep it private; if lost, the message cannot be recovered. Firebase record IDs remain visible. Prototype only: use sample data, not real patient information.</p>
+        <p>Patient messages and device status flags with timestamps are end-to-end encrypted in this browser with AES-256-GCM before being sent to Firebase. Only someone with the passphrase can decrypt them. Firebase never receives the passphrase or plaintext. Use a strong passphrase of at least 12 characters and keep it private; if lost, records cannot be recovered. Firebase record IDs remain visible. Prototype only: use sample data, not real patient information.</p>
         <label for="patientMsg">Patient message</label><br>
         <input type="text" id="patientMsg" placeholder="Type a sample message">
         <br><br>
@@ -82,6 +97,8 @@
         <input type="password" id="encryptionPassphrase" minlength="12" autocomplete="new-password" placeholder="Enter a strong passphrase">
         <br>
         <button onclick="encryptAndSave()">Encrypt & Save</button>
+        <button onclick="syncStatusFlags()">Encrypt & Sync Status Flags</button>
+        <p>Status updates include connection/camera/privacy/capture flags and event timestamps. Video and gaze coordinates are not sent.</p>
         <hr>
         <label for="recordId">Firebase record ID</label><br>
         <input type="text" id="recordId" placeholder="Paste the record ID shown after saving">
@@ -119,9 +136,11 @@
     const db = firebase.database();
     const encryptionIterations = 310000;
     const encryptionContext = new TextEncoder().encode("patient-message:v1");
+    let databaseConnected = false;
 
     db.ref(".info/connected").on("value", (snapshot) => {
         const status = document.getElementById("databaseStatus");
+        databaseConnected = Boolean(snapshot.val());
         status.innerText = snapshot.val()
             ? "Database status: Connected"
             : "Database status: Disconnected";
@@ -133,6 +152,48 @@
     let currentY = 120;
     let targetX = 160;
     let targetY = 120;
+    let lastCoordinatePacketCapturedAt = null;
+    let lastMaskedFrameCapturedAt = null;
+    const maskedFrameCanvas = document.createElement("canvas");
+    maskedFrameCanvas.width = 32;
+    maskedFrameCanvas.height = 24;
+    const maskedFrameContext = maskedFrameCanvas.getContext("2d");
+
+    function drawPixelatedVideo(source, context, canvas) {
+        const sourceWidth = source.videoWidth;
+        const sourceHeight = source.videoHeight;
+        if (!sourceWidth || !sourceHeight) {
+            return false;
+        }
+
+        const targetAspect = canvas.width / canvas.height;
+        const sourceAspect = sourceWidth / sourceHeight;
+        let cropX = 0;
+        let cropY = 0;
+        let cropWidth = sourceWidth;
+        let cropHeight = sourceHeight;
+
+        if (sourceAspect > targetAspect) {
+            cropWidth = sourceHeight * targetAspect;
+            cropX = (sourceWidth - cropWidth) / 2;
+        } else {
+            cropHeight = sourceWidth / targetAspect;
+            cropY = (sourceHeight - cropHeight) / 2;
+        }
+
+        maskedFrameContext.clearRect(0, 0, maskedFrameCanvas.width, maskedFrameCanvas.height);
+        maskedFrameContext.imageSmoothingEnabled = true;
+        maskedFrameContext.drawImage(
+            source,
+            cropX, cropY, cropWidth, cropHeight,
+            0, 0, maskedFrameCanvas.width, maskedFrameCanvas.height
+        );
+
+        context.imageSmoothingEnabled = false;
+        context.drawImage(maskedFrameCanvas, 0, 0, canvas.width, canvas.height);
+        context.imageSmoothingEnabled = true;
+        return true;
+    }
 
     // Start live device webcam and visual tracking loop
     function startWebcam() {
@@ -141,7 +202,7 @@
             .then((stream) => {
                 videoStream = stream;
                 videoElement.srcObject = stream;
-                document.getElementById("gazeOutput").innerText = "SUCCESS: Live camera stream active. Interactive visual tracking engaged.";
+                document.getElementById("gazeOutput").innerText = "SUCCESS: Camera active. Live preview is pixelated locally; raw video is not saved or uploaded.";
                 startDetectionOverlay();
             })
             .catch((error) => {
@@ -156,6 +217,7 @@
 
         function renderFrame() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
+            drawPixelatedVideo(document.getElementById("webcamVideo"), ctx, canvas);
 
             // Smoothly move towards target point
             currentX += (targetX - currentX) * 0.1;
@@ -197,6 +259,33 @@
         renderFrame();
     }
 
+    function captureMaskedFrame() {
+        const videoElement = document.getElementById("webcamVideo");
+        const output = document.getElementById("videoPrivacyStatus");
+        if (!videoStream || videoElement.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+            output.innerText = "Enable the camera and wait for a video frame before capturing.";
+            return;
+        }
+
+        const canvas = document.getElementById("detectionCanvas");
+        const context = canvas.getContext("2d");
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        if (!drawPixelatedVideo(videoElement, context, canvas)) {
+            output.innerText = "The camera frame is not ready yet. Please try again.";
+            return;
+        }
+
+        const imageUrl = canvas.toDataURL("image/png");
+        const preview = document.getElementById("maskedFramePreview");
+        const downloadLink = document.getElementById("downloadMaskedFrame");
+        preview.src = imageUrl;
+        preview.hidden = false;
+        downloadLink.href = imageUrl;
+        downloadLink.hidden = false;
+        lastMaskedFrameCapturedAt = new Date().toISOString();
+        output.innerText = "Captured a pixelated frame locally. Only this masked image can be downloaded.";
+    }
+
     // Capture real-time coordinate packet from live interaction
     function captureCoordinatePacket() {
         if (!videoStream) {
@@ -211,6 +300,7 @@
             normalizedY: (currentY / 240).toFixed(4),
             privacyStatus: "Scrubbed locally - Hardware ID omitted"
         };
+        lastCoordinatePacketCapturedAt = coordinatePacket.timestamp;
 
         document.getElementById("gazeOutput").innerText = 
             "Live Gaze Coordinate Stream Captured:\n\n" + 
@@ -247,14 +337,11 @@
         );
     }
 
-    async function encryptPatientMessage(message, passphrase) {
+    async function encryptPatientData(data, passphrase) {
         const salt = crypto.getRandomValues(new Uint8Array(16));
         const iv = crypto.getRandomValues(new Uint8Array(12));
         const key = await deriveEncryptionKey(passphrase, salt);
-        const plaintext = new TextEncoder().encode(JSON.stringify({
-            message,
-            timestamp: new Date().toISOString()
-        }));
+        const plaintext = new TextEncoder().encode(JSON.stringify(data));
         const ciphertext = await crypto.subtle.encrypt(
             { name: "AES-GCM", iv, additionalData: encryptionContext, tagLength: 128 },
             key,
@@ -270,6 +357,13 @@
             iv: bytesToBase64(iv),
             ciphertext: bytesToBase64(new Uint8Array(ciphertext))
         };
+    }
+
+    async function encryptPatientMessage(message, passphrase) {
+        return encryptPatientData({
+            message,
+            timestamp: new Date().toISOString()
+        }, passphrase);
     }
 
     async function decryptPatientMessage(record, passphrase) {
@@ -328,6 +422,51 @@
                 JSON.stringify(encryptedRecord, null, 2);
         } catch (error) {
             output.innerText = "ERROR: Could not encrypt or save the message: " + error.message;
+        }
+    }
+
+    async function syncStatusFlags() {
+        const passphrase = document.getElementById("encryptionPassphrase").value;
+        const output = document.getElementById("cloudOutput");
+        const decryptedOutput = document.getElementById("decryptedOutput");
+        decryptedOutput.innerText = "";
+
+        if (passphrase.length < 12) {
+            output.innerText = "Use an encryption passphrase of at least 12 characters.";
+            return;
+        }
+
+        const cameraActive = Boolean(
+            videoStream && videoStream.getTracks().some((track) => track.readyState === "live")
+        );
+        const statusUpdate = {
+            recordType: "status_flags",
+            timestamp: new Date().toISOString(),
+            statusFlags: {
+                databaseConnected,
+                cameraActive,
+                privacyMaskEnabled: true,
+                maskedFrameCaptured: Boolean(lastMaskedFrameCapturedAt),
+                coordinatePacketCaptured: Boolean(lastCoordinatePacketCapturedAt)
+            },
+            eventTimestamps: {
+                maskedFrameCapturedAt: lastMaskedFrameCapturedAt,
+                coordinatePacketCapturedAt: lastCoordinatePacketCapturedAt
+            }
+        };
+
+        output.innerText = "Encrypting status flags locally...";
+        try {
+            const encryptedRecord = await encryptPatientData(statusUpdate, passphrase);
+            const recordRef = db.ref("secure_gaze_logs").push();
+            await recordRef.set(encryptedRecord);
+            document.getElementById("recordId").value = recordRef.key;
+            output.innerText =
+                "SUCCESS: Encrypted status flags and timestamps synced to Firebase.\n\n" +
+                "Firebase record ID: " + recordRef.key + "\n\n" +
+                JSON.stringify(encryptedRecord, null, 2);
+        } catch (error) {
+            output.innerText = "ERROR: Could not encrypt or sync status flags: " + error.message;
         }
     }
 
