@@ -108,12 +108,13 @@
         <pre id="decryptedOutput" aria-live="polite"></pre>
     </div>
 
-    <!-- Module 3: Cyber Defense & Audit Log -->
+    <!-- Module 3: Security Event Simulation Log -->
     <div class="module">
-        <h3>3. Cyberattack Defense & Immutable Audit Trail</h3>
-        <p>Simulates an unauthorized intrusion attempt to test access control policies.</p>
-        <button class="btn-danger" onclick="simulateAttack()">Simulate Unauthorized Intrusion</button>
-        <pre id="auditOutput">System status: Secure. No threats detected.</pre>
+        <h3>3. Security Event Simulation Log</h3>
+        <p>This creates a simulated intrusion event only; it does not send or block a real request. Events are listed for this page session and can be saved encrypted to Firebase with the passphrase. Firebase Realtime Database provides security rules; configure them to restrict event creation to authorized users and prevent existing audit records from being changed or deleted.</p>
+        <button class="btn-danger" onclick="simulateAttack()">Log Simulated Intrusion</button>
+        <p id="auditSyncStatus" role="status">Enter your encryption passphrase to sync simulation events.</p>
+        <pre id="auditOutput">No simulation events recorded in this page session.</pre>
     </div>
 </div>
 
@@ -154,6 +155,7 @@
     let targetY = 120;
     let lastCoordinatePacketCapturedAt = null;
     let lastMaskedFrameCapturedAt = null;
+    const auditEvents = [];
     const maskedFrameCanvas = document.createElement("canvas");
     maskedFrameCanvas.width = 32;
     maskedFrameCanvas.height = 24;
@@ -503,9 +505,40 @@
         }
     }
 
-    function simulateAttack() {
-        let log = `[ALERT] Unauthorized external IP attempted remote firmware injection.\n[ACTION] Access Control Policy triggered: Request dropped.\n[STATUS] Immutable audit log updated successfully.`;
-        document.getElementById("auditOutput").innerText = log;
+    async function simulateAttack() {
+        const event = {
+            recordType: "simulation_audit_event",
+            timestamp: new Date().toISOString(),
+            simulated: true,
+            event: "unauthorized_access_attempt",
+            target: "firmware_injection",
+            outcome: "simulated_request_dropped",
+            note: "No external request was sent or blocked."
+        };
+        const auditOutput = document.getElementById("auditOutput");
+        const syncStatus = document.getElementById("auditSyncStatus");
+        auditEvents.push(event);
+        auditOutput.innerText = JSON.stringify(auditEvents, null, 2);
+
+        const passphrase = document.getElementById("encryptionPassphrase").value;
+        if (passphrase.length < 12) {
+            syncStatus.innerText =
+                "Event logged for this page session only. Enter a passphrase of at least 12 characters to sync it to Firebase.";
+            return;
+        }
+
+        syncStatus.innerText = "Encrypting and syncing the simulation event...";
+        try {
+            const encryptedRecord = await encryptPatientData(event, passphrase);
+            const recordRef = db.ref("secure_gaze_logs").push();
+            await recordRef.set(encryptedRecord);
+            syncStatus.innerText =
+                "Encrypted simulation event saved to Firebase. Record ID: " + recordRef.key;
+        } catch (error) {
+            syncStatus.innerText =
+                "Event remains in this page session, but Firebase save failed: " +
+                error.code + " " + error.message;
+        }
     }
 </script>
 
