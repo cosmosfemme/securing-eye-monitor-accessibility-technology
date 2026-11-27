@@ -59,6 +59,7 @@
 
     <!-- Firebase SDKs -->
     <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-auth.js"></script>
     <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
 </head>
 <body>
@@ -103,6 +104,7 @@
         <label for="recordId">Firebase record ID</label><br>
         <input type="text" id="recordId" placeholder="Paste the record ID shown after saving">
         <button onclick="loadAndDecrypt()">Load & Decrypt</button>
+        <p id="authStatus" role="status">Signing in anonymously...</p>
         <p id="databaseStatus" role="status">Database status: Connecting...</p>
         <pre id="cloudOutput">Cloud status: Ready to sync...</pre>
         <pre id="decryptedOutput" aria-live="polite"></pre>
@@ -135,9 +137,81 @@
         firebase.initializeApp(firebaseConfig);
     }
     const db = firebase.database();
+    const auth = firebase.auth();
     const encryptionIterations = 310000;
     const encryptionContext = new TextEncoder().encode("patient-message:v1");
     let databaseConnected = false;
+
+    function waitForUserOrSignIn() {
+        return new Promise((resolve, reject) => {
+            let unsubscribe = () => {};
+            unsubscribe = auth.onAuthStateChanged((user) => {
+                unsubscribe();
+                if (user) {
+                    resolve(user);
+                    return;
+                }
+
+                auth.signInAnonymously()
+                    .then((credential) => resolve(credential.user))
+                    .catch(reject);
+            }, (error) => {
+                unsubscribe();
+                reject(error);
+            });
+        });
+    }
+
+    const authReady = waitForUserOrSignIn()
+        .then((user) => {
+            document.getElementById("authStatus").innerText =
+                "Authentication: Signed in anonymously";
+            return user;
+        })
+        .catch((error) => {
+            document.getElementById("authStatus").innerText =
+                "Authentication error: " + error.message;
+            console.error("Firebase anonymous sign-in failed:", error);
+            return null;
+        });
+    let authRetry = null;
+
+    async function ensureSignedIn() {
+        if (auth.currentUser) {
+            return auth.currentUser.uid;
+        }
+
+        const initialUser = await authReady;
+        if (initialUser && auth.currentUser) {
+            return auth.currentUser.uid;
+        }
+
+        if (!authRetry) {
+            authRetry = auth.signInAnonymously()
+                .then((credential) => {
+                    document.getElementById("authStatus").innerText =
+                        "Authentication: Signed in anonymously";
+                    return credential.user;
+                })
+                .catch((error) => {
+                    document.getElementById("authStatus").innerText =
+                        "Authentication error: " + error.message;
+                    console.error("Firebase anonymous sign-in failed:", error);
+                    throw error;
+                })
+                .finally(() => {
+                    authRetry = null;
+                });
+        }
+
+        const user = await authRetry;
+        return user.uid;
+    }
+
+    async function getUserLogCollection() {
+        const uid = await ensureSignedIn();
+        return db.ref("users/" + uid + "/secure_gaze_logs");
+    }
 
     db.ref(".info/connected").on("value", (snapshot) => {
         const status = document.getElementById("databaseStatus");
@@ -414,7 +488,7 @@
         output.innerText = "Encrypting message locally...";
         try {
             const encryptedRecord = await encryptPatientMessage(msg, passphrase);
-            const recordRef = db.ref("secure_gaze_logs").push();
+            const recordRef = (await getUserLogCollection()).push();
             await recordRef.set(encryptedRecord);
             document.getElementById("recordId").value = recordRef.key;
             document.getElementById("patientMsg").value = "";
@@ -460,7 +534,7 @@
         output.innerText = "Encrypting status flags locally...";
         try {
             const encryptedRecord = await encryptPatientData(statusUpdate, passphrase);
-            const recordRef = db.ref("secure_gaze_logs").push();
+            const recordRef = (await getUserLogCollection()).push();
             await recordRef.set(encryptedRecord);
             document.getElementById("recordId").value = recordRef.key;
             output.innerText =
@@ -490,7 +564,8 @@
 
         output.innerText = "Loading encrypted record...";
         try {
-            const snapshot = await db.ref("secure_gaze_logs/" + recordId).once("value");
+            const logsRef = await getUserLogCollection();
+            const snapshot = await logsRef.child(recordId).once("value");
             if (!snapshot.exists()) {
                 output.innerText = "No record found with that ID.";
                 return;
@@ -530,7 +605,7 @@
         syncStatus.innerText = "Encrypting and syncing the simulation event...";
         try {
             const encryptedRecord = await encryptPatientData(event, passphrase);
-            const recordRef = db.ref("secure_gaze_logs").push();
+            const recordRef = (await getUserLogCollection()).push();
             await recordRef.set(encryptedRecord);
             syncStatus.innerText =
                 "Encrypted simulation event saved to Firebase. Record ID: " + recordRef.key;

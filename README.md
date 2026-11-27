@@ -12,9 +12,9 @@ Access the deployed web application directly in your browser:
 
 ## Core Features
 - **Real-Time Eye-Gaze Tracking:** Browser-based webcam stream processing with an HTML5 Canvas overlay for responsive, hands-free assistive control.
-- **Patient Privacy & Visual Masking:** Local frame processing and facial privacy masking ensure raw patient video never leaves the client device unmasked.
+- **Patient Privacy & Visual Masking:** The live camera preview is pixelated across the full frame in the browser. Captured frames use the masked preview; raw video is not saved or sent to Firebase.
 - **End-to-End Data Security:** Client-side encryption and strict access controls safeguard gaze tracking metrics against unauthorized interception and cyberattacks.
-- **IoMT Cloud Synchronization:** Real-time integration with Firebase for reliable patient state logging and secure remote caregiver monitoring.
+- **IoMT Cloud Synchronization:** Encrypted patient messages, status flags, and simulation events can be synced to Firebase under an anonymous user's UID. Realtime Database rules must enforce per-user access; video and gaze coordinates remain local.
 - **Zero-Installation Access:** Hosted via GitHub Pages for instant cross-platform testing without local software dependencies.
 
 ---
@@ -29,4 +29,6 @@ Access the deployed web application directly in your browser:
 ## How to Run & Test
 1. Open the **[Live Demo Link](https://cosmosfemme.github.io/securing-eye-monitor-accessibility-technology/)**.
 2. Grant browser **Camera permissions** when prompted to initialize the live eye-tracking feed.
-3. Toggle privacy masking and cloud sync options within the interface to verify real-time biometric data streams and security controls.
+3. Enable the camera to view the pixelated preview, then capture a masked frame. The raw video is not saved or uploaded.
+4. Enter a passphrase and choose **Encrypt & Sync Status Flags** to send encrypted status flags and timestamps to Firebase.
+5. Enable Anonymous sign-in in Firebase Authentication and configure Realtime Database rules for `/users/{uid}/secure_gaze_logs/{recordId}` before syncing records.
