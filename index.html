@@ -61,6 +61,7 @@
     <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
     <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-auth.js"></script>
     <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js" crossorigin="anonymous"></script>
 </head>
 <body>
 
@@ -70,7 +71,7 @@
 
     <!-- Module 1: Live Webcam & Interactive Detection Overlay -->
     <div class="module">
-        <h3>1. Live Webcam Feed & Local Gaze Coordinate Stream</h3>
+        <h3>1. Local Eye/Iris Detection & Approximate Direction</h3>
         <p>The live camera preview is pixelated in-browser for privacy. Capture and download only the masked frame; raw video is not saved or sent to Firebase.</p>
         
         <div class="video-container">
@@ -81,6 +82,8 @@
         <button onclick="startWebcam()">Enable Camera Stream</button>
         <button onclick="captureCoordinatePacket()">Capture Live Coordinate Packet</button>
         <button onclick="captureMaskedFrame()">Capture Masked Frame</button>
+        <p id="eyeDetectionStatus" role="status">Eye detection: not started</p>
+        <p>Local iris tracking estimates eye direction; it is not calibrated screen gaze or a medical measurement.</p>
         <p id="videoPrivacyStatus" role="status">Privacy mask: enabled (full-frame pixelation)</p>
         <img id="maskedFramePreview" alt="Captured pixelated camera frame" hidden>
         <p><a id="downloadMaskedFrame" download="masked-camera-frame.png" hidden>Download masked frame</a></p>
@@ -222,11 +225,15 @@
     });
 
     let videoStream = null;
+    let cameraStarting = false;
     let detectionAnimation = null;
     let currentX = 160;
     let currentY = 120;
-    let targetX = 160;
-    let targetY = 120;
+    let faceMesh = null;
+    let faceMeshReady = false;
+    let inferenceInProgress = false;
+    let lastInferenceAt = 0;
+    let latestFaceLandmarks = null;
     let lastCoordinatePacketCapturedAt = null;
     let lastMaskedFrameCapturedAt = null;
     const auditEvents = [];
@@ -271,68 +278,206 @@
         return true;
     }
 
-    // Start live device webcam and visual tracking loop
-    function startWebcam() {
-        const videoElement = document.getElementById('webcamVideo');
-        navigator.mediaDevices.getUserMedia({ video: true })
-            .then((stream) => {
-                videoStream = stream;
-                videoElement.srcObject = stream;
-                document.getElementById("gazeOutput").innerText = "SUCCESS: Camera active. Live preview is pixelated locally; raw video is not saved or uploaded.";
-                startDetectionOverlay();
-            })
-            .catch((error) => {
-                document.getElementById("gazeOutput").innerText = "ERROR: Camera access denied or unavailable. (" + error.message + ")";
-            });
+    function initializeEyeDetector() {
+        if (typeof FaceMesh !== "function") {
+            throw new Error("MediaPipe Face Mesh could not be loaded. Check your internet connection and reload.");
+        }
+
+        faceMesh = new FaceMesh({
+            locateFile: (file) =>
+                "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/" + file
+        });
+        faceMesh.setOptions({
+            maxNumFaces: 1,
+            refineLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        faceMesh.onResults((results) => {
+            const faceLandmarks =
+                results.multiFaceLandmarks && results.multiFaceLandmarks.length
+                    ? results.multiFaceLandmarks[0]
+                    : null;
+            if (faceLandmarks && updateGazeEstimate(faceLandmarks)) {
+                latestFaceLandmarks = faceLandmarks;
+                document.getElementById("eyeDetectionStatus").innerText =
+                    "Eye detection: face and iris landmarks detected (local estimate)";
+            } else {
+                latestFaceLandmarks = null;
+                document.getElementById("eyeDetectionStatus").innerText =
+                    faceLandmarks
+                        ? "Eye detection: face found, but iris landmarks are unavailable"
+                        : "Eye detection: no face detected; move into camera view";
+            }
+        });
+        faceMeshReady = true;
     }
 
-    // Draws live detection bounding box (square) and focus target (circle) onto the canvas overlay
+    // Start the camera and local MediaPipe face/iris landmark tracking.
+    async function startWebcam() {
+        const videoElement = document.getElementById('webcamVideo');
+        const detectionStatus = document.getElementById("eyeDetectionStatus");
+        if (videoStream || cameraStarting) {
+            return;
+        }
+
+        cameraStarting = true;
+        try {
+            videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
+            videoElement.srcObject = videoStream;
+            await videoElement.play();
+            initializeEyeDetector();
+            document.getElementById("gazeOutput").innerText =
+                "Camera active. Video is processed locally and the displayed preview remains pixelated.";
+            detectionStatus.innerText = "Eye detection: loading face and iris model...";
+            startDetectionOverlay();
+        } catch (error) {
+            if (videoStream) {
+                videoStream.getTracks().forEach((track) => track.stop());
+                videoStream = null;
+            }
+            videoElement.srcObject = null;
+            detectionStatus.innerText = "Eye detection error: " + error.message;
+            document.getElementById("gazeOutput").innerText =
+                "ERROR: Could not start camera or eye detection: " + error.message;
+        } finally {
+            cameraStarting = false;
+        }
+    }
+
+    function averageLandmark(landmarks, indices) {
+        const points = indices.map((index) => landmarks[index]);
+        if (points.some((point) => !point)) {
+            return null;
+        }
+        return points.reduce(
+            (average, point) => ({
+                x: average.x + point.x / points.length,
+                y: average.y + point.y / points.length
+            }),
+            { x: 0, y: 0 }
+        );
+    }
+
+    function getEyePositionRatio(landmarks, irisIndices, cornerIndices, lidIndices) {
+        const iris = averageLandmark(landmarks, irisIndices);
+        const corners = cornerIndices.map((index) => landmarks[index]);
+        const lids = lidIndices.map((index) => landmarks[index]);
+        if (!iris || corners.some((point) => !point) || lids.some((point) => !point)) {
+            return null;
+        }
+
+        const cornerMinX = Math.min(corners[0].x, corners[1].x);
+        const cornerWidth = Math.abs(corners[1].x - corners[0].x);
+        const lidMinY = Math.min(lids[0].y, lids[1].y);
+        const lidHeight = Math.abs(lids[1].y - lids[0].y);
+        if (cornerWidth < 0.001 || lidHeight < 0.001) {
+            return null;
+        }
+
+        return {
+            x: (iris.x - cornerMinX) / cornerWidth,
+            y: (iris.y - lidMinY) / lidHeight,
+            iris
+        };
+    }
+
+    function updateGazeEstimate(landmarks) {
+        const leftEye = getEyePositionRatio(landmarks, [468, 469, 470, 471, 472], [33, 133], [159, 145]);
+        const rightEye = getEyePositionRatio(landmarks, [473, 474, 475, 476, 477], [362, 263], [386, 374]);
+        const visibleEyes = [leftEye, rightEye].filter(Boolean);
+        if (!visibleEyes.length) {
+            return false;
+        }
+
+        const averageX = visibleEyes.reduce((sum, eye) => sum + eye.x, 0) / visibleEyes.length;
+        const averageY = visibleEyes.reduce((sum, eye) => sum + eye.y, 0) / visibleEyes.length;
+        const targetX = Math.max(0, Math.min(1, averageX)) * 320;
+        const targetY = Math.max(0, Math.min(1, averageY)) * 240;
+        currentX += (targetX - currentX) * 0.25;
+        currentY += (targetY - currentY) * 0.25;
+        return true;
+    }
+
+    function mapLandmarkToCanvas(point, source, canvas) {
+        const sourceWidth = source.videoWidth;
+        const sourceHeight = source.videoHeight;
+        const targetAspect = canvas.width / canvas.height;
+        const sourceAspect = sourceWidth / sourceHeight;
+        let cropX = 0;
+        let cropY = 0;
+        let cropWidth = sourceWidth;
+        let cropHeight = sourceHeight;
+
+        if (sourceAspect > targetAspect) {
+            cropWidth = sourceHeight * targetAspect;
+            cropX = (sourceWidth - cropWidth) / 2;
+        } else {
+            cropHeight = sourceWidth / targetAspect;
+            cropY = (sourceHeight - cropHeight) / 2;
+        }
+
+        return {
+            x: ((point.x * sourceWidth - cropX) / cropWidth) * canvas.width,
+            y: ((point.y * sourceHeight - cropY) / cropHeight) * canvas.height
+        };
+    }
+
+    // Draws the pixelated camera preview and eye landmarks; inference runs locally.
     function startDetectionOverlay() {
         const canvas = document.getElementById('detectionCanvas');
         const ctx = canvas.getContext('2d');
+        const videoElement = document.getElementById("webcamVideo");
 
-        function renderFrame() {
+        function renderFrame(timestamp) {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            drawPixelatedVideo(document.getElementById("webcamVideo"), ctx, canvas);
+            drawPixelatedVideo(videoElement, ctx, canvas);
 
-            // Smoothly move towards target point
-            currentX += (targetX - currentX) * 0.1;
-            currentY += (targetY - currentY) * 0.1;
-
-            // Periodically shift eye coordinate focus target within active center bounds
-            if (Math.random() < 0.05) {
-                targetX = 110 + Math.random() * 100;
-                targetY = 80 + Math.random() * 80;
+            if (
+                faceMeshReady &&
+                !inferenceInProgress &&
+                videoElement.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+                timestamp - lastInferenceAt >= 66
+            ) {
+                inferenceInProgress = true;
+                lastInferenceAt = timestamp;
+                faceMesh.send({ image: videoElement })
+                    .catch((error) => {
+                        faceMeshReady = false;
+                        document.getElementById("eyeDetectionStatus").innerText =
+                            "Eye detection error: " + error.message;
+                    })
+                    .finally(() => {
+                        inferenceInProgress = false;
+                    });
             }
 
-            // Draw bounding square around detected region
-            const boxSize = 70;
-            ctx.strokeStyle = '#00ffcc';
-            ctx.lineWidth = 2;
-            ctx.strokeRect(currentX - boxSize/2, currentY - boxSize/2, boxSize, boxSize);
+            if (latestFaceLandmarks && videoElement.videoWidth && videoElement.videoHeight) {
+                [averageLandmark(latestFaceLandmarks, [468, 469, 470, 471, 472]),
+                    averageLandmark(latestFaceLandmarks, [473, 474, 475, 476, 477])]
+                    .filter(Boolean)
+                    .forEach((iris) => {
+                        const position = mapLandmarkToCanvas(iris, videoElement, canvas);
+                        ctx.beginPath();
+                        ctx.arc(position.x, position.y, 7, 0, 2 * Math.PI);
+                        ctx.strokeStyle = "#00ffcc";
+                        ctx.lineWidth = 2;
+                        ctx.stroke();
+                    });
+            }
 
-            // Draw outer gaze target circle
             ctx.beginPath();
-            ctx.arc(currentX, currentY, 15, 0, 2 * Math.PI);
-            ctx.strokeStyle = '#ff0055';
-            ctx.lineWidth = 2;
-            ctx.stroke();
-
-            // Draw inner gaze focus point
-            ctx.beginPath();
-            ctx.arc(currentX, currentY, 4, 0, 2 * Math.PI);
+            ctx.arc(currentX, currentY, 8, 0, 2 * Math.PI);
             ctx.fillStyle = '#ff0055';
             ctx.fill();
-
-            // Draw real-time dynamic coordinate label on overlay
             ctx.fillStyle = '#00ffcc';
             ctx.font = '10px monospace';
-            ctx.fillText(`X: ${(currentX/320).toFixed(2)} | Y: ${(currentY/240).toFixed(2)}`, currentX - 35, currentY + 48);
+            ctx.fillText(`Approx. eye direction X: ${(currentX / 320).toFixed(2)} | Y: ${(currentY / 240).toFixed(2)}`, 6, 14);
 
             detectionAnimation = requestAnimationFrame(renderFrame);
         }
 
-        renderFrame();
+        detectionAnimation = requestAnimationFrame(renderFrame);
     }
 
     function captureMaskedFrame() {
@@ -364,8 +509,9 @@
 
     // Capture real-time coordinate packet from live interaction
     function captureCoordinatePacket() {
-        if (!videoStream) {
-            alert("Please enable the camera stream first!");
+        if (!videoStream || !latestFaceLandmarks) {
+            document.getElementById("gazeOutput").innerText =
+                "Enable the camera and wait until face and iris landmarks are detected.";
             return;
         }
 
@@ -521,6 +667,7 @@
             statusFlags: {
                 databaseConnected,
                 cameraActive,
+                eyeDetected: Boolean(latestFaceLandmarks),
                 privacyMaskEnabled: true,
                 maskedFrameCaptured: Boolean(lastMaskedFrameCapturedAt),
                 coordinatePacketCaptured: Boolean(lastCoordinatePacketCapturedAt)
