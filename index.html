@@ -55,6 +55,58 @@
         #maskedFramePreview[hidden] {
             display: none;
         }
+        .calibration-area {
+            position: relative;
+            width: min(100%, 480px);
+            height: 260px;
+            margin: 12px 0;
+            border: 1px solid #bdc3c7;
+            border-radius: 6px;
+            background: #fff;
+        }
+        #calibrationTarget {
+            position: absolute;
+            width: 28px;
+            height: 28px;
+            border: 4px solid #e74c3c;
+            border-radius: 50%;
+            background: #fff;
+            transform: translate(-50%, -50%);
+            box-sizing: border-box;
+        }
+        .message-board {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 8px;
+            max-width: 600px;
+            margin: 12px 0;
+        }
+        .message-board button {
+            min-height: 64px;
+            margin: 0;
+            background: #fff;
+            color: #2c3e50;
+            border: 2px solid #3498db;
+            font-size: 15px;
+            font-weight: bold;
+        }
+        .message-board button.gaze-highlight {
+            background: #d6f5e8;
+            border-color: #16a085;
+            box-shadow: 0 0 0 3px rgba(22, 160, 133, 0.25);
+        }
+        .dwell-progress {
+            width: min(100%, 600px);
+            height: 10px;
+            background: #d5dbdb;
+            border-radius: 5px;
+            overflow: hidden;
+        }
+        #dwellProgressFill {
+            width: 0;
+            height: 100%;
+            background: #16a085;
+        }
     </style>
 
     <!-- Firebase SDKs -->
@@ -84,6 +136,17 @@
         <button onclick="captureMaskedFrame()">Capture Masked Frame</button>
         <p id="eyeDetectionStatus" role="status">Eye detection: not started</p>
         <p>Local iris tracking estimates eye direction; it is not calibrated screen gaze or a medical measurement.</p>
+        <h4>Gaze-to-message board</h4>
+        <p>Complete calibration while looking at each target. Then hold your gaze on a message choice to select it. Dwell selection adds text locally; selecting SEND encrypts and saves the message to Firebase.</p>
+        <button onclick="beginGazeCalibration()">Start gaze calibration</button>
+        <button id="recordCalibrationButton" onclick="recordCalibrationPoint()" disabled>Record gaze at target</button>
+        <p id="calibrationStatus" role="status">Start the camera and calibration to use gaze selection.</p>
+        <div class="calibration-area" aria-label="Look at the highlighted target during calibration">
+            <span id="calibrationTarget" hidden></span>
+        </div>
+        <div id="gazeMessageBoard" class="message-board" aria-label="Gaze message choices"></div>
+        <p id="dwellStatus" role="status">Gaze selection is not calibrated.</p>
+        <div class="dwell-progress" aria-hidden="true"><div id="dwellProgressFill"></div></div>
         <p id="videoPrivacyStatus" role="status">Privacy mask: enabled (full-frame pixelation)</p>
         <img id="maskedFramePreview" alt="Captured pixelated camera frame" hidden>
         <p><a id="downloadMaskedFrame" download="masked-camera-frame.png" hidden>Download masked frame</a></p>
@@ -234,6 +297,32 @@
     let inferenceInProgress = false;
     let lastInferenceAt = 0;
     let latestFaceLandmarks = null;
+    let latestEyePosition = null;
+    let gazeCalibration = null;
+    let calibrationSamples = [];
+    let calibrationTargetIndex = 0;
+    let dwellCandidateCell = null;
+    let dwellStartedAt = 0;
+    let dwellSelectedCell = null;
+    const dwellDurationMs = 1400;
+    const calibrationTargets = [
+        { x: 0.12, y: 0.12 },
+        { x: 0.88, y: 0.12 },
+        { x: 0.88, y: 0.88 },
+        { x: 0.12, y: 0.88 },
+        { x: 0.5, y: 0.5 }
+    ];
+    const gazeMessageChoices = [
+        { label: "I need help", message: "I need help" },
+        { label: "I need water", message: "I need water" },
+        { label: "I need food", message: "I need food" },
+        { label: "Yes", message: "Yes" },
+        { label: "No", message: "No" },
+        { label: "I feel unwell", message: "I feel unwell" },
+        { label: "Please come here", message: "Please come here" },
+        { label: "Space", action: "space" },
+        { label: "Send message", action: "send" }
+    ];
     let lastCoordinatePacketCapturedAt = null;
     let lastMaskedFrameCapturedAt = null;
     const auditEvents = [];
@@ -241,6 +330,218 @@
     maskedFrameCanvas.width = 32;
     maskedFrameCanvas.height = 24;
     const maskedFrameContext = maskedFrameCanvas.getContext("2d");
+    const gazeMessageBoard = document.getElementById("gazeMessageBoard");
+
+    gazeMessageChoices.forEach((choice, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = choice.label;
+        button.dataset.cell = String(index);
+        button.addEventListener("click", () => selectGazeMessage(index));
+        gazeMessageBoard.appendChild(button);
+    });
+
+    function beginGazeCalibration() {
+        if (!videoStream || !latestFaceLandmarks || !latestEyePosition) {
+            document.getElementById("calibrationStatus").innerText =
+                "Enable the camera and wait for face and iris detection before calibrating.";
+            return;
+        }
+
+        calibrationSamples = [];
+        calibrationTargetIndex = 0;
+        gazeCalibration = null;
+        dwellCandidateCell = null;
+        dwellSelectedCell = null;
+        document.getElementById("recordCalibrationButton").disabled = false;
+        document.getElementById("calibrationTarget").hidden = false;
+        document.getElementById("dwellStatus").innerText = "Calibration in progress.";
+        document.getElementById("dwellProgressFill").style.width = "0";
+        document.querySelectorAll(".message-board button").forEach((button) => {
+            button.classList.remove("gaze-highlight");
+        });
+        showCalibrationTarget();
+    }
+
+    function showCalibrationTarget() {
+        const target = calibrationTargets[calibrationTargetIndex];
+        const marker = document.getElementById("calibrationTarget");
+        marker.style.left = (target.x * 100) + "%";
+        marker.style.top = (target.y * 100) + "%";
+        document.getElementById("calibrationStatus").innerText =
+            "Look at target " + (calibrationTargetIndex + 1) + " of " + calibrationTargets.length +
+            ", keep your head still, then select Record gaze at target.";
+    }
+
+    function recordCalibrationPoint() {
+        if (!latestFaceLandmarks || !latestEyePosition) {
+            document.getElementById("calibrationStatus").innerText =
+                "No eyes detected. Look at the camera and try recording this target again.";
+            return;
+        }
+
+        const target = calibrationTargets[calibrationTargetIndex];
+        calibrationSamples.push({
+            input: { x: latestEyePosition.x, y: latestEyePosition.y },
+            output: target
+        });
+        calibrationTargetIndex += 1;
+
+        if (calibrationTargetIndex < calibrationTargets.length) {
+            showCalibrationTarget();
+            return;
+        }
+
+        try {
+            gazeCalibration = fitGazeCalibration(calibrationSamples);
+            document.getElementById("calibrationTarget").hidden = true;
+            document.getElementById("recordCalibrationButton").disabled = true;
+            document.getElementById("calibrationStatus").innerText =
+                "Calibration complete. Hold your gaze on a message choice for about 1.4 seconds.";
+            document.getElementById("dwellStatus").innerText = "Gaze selection ready.";
+        } catch (error) {
+            gazeCalibration = null;
+            calibrationTargetIndex = 0;
+            calibrationSamples = [];
+            showCalibrationTarget();
+            document.getElementById("calibrationStatus").innerText =
+                "Calibration failed: " + error.message + " Please record the targets again.";
+        }
+    }
+
+    function fitGazeCalibration(samples) {
+        const normal = Array.from({ length: 3 }, () => [0, 0, 0]);
+        const rightX = [0, 0, 0];
+        const rightY = [0, 0, 0];
+
+        samples.forEach(({ input, output }) => {
+            const vector = [input.x, input.y, 1];
+            for (let row = 0; row < 3; row += 1) {
+                for (let column = 0; column < 3; column += 1) {
+                    normal[row][column] += vector[row] * vector[column];
+                }
+                rightX[row] += vector[row] * output.x;
+                rightY[row] += vector[row] * output.y;
+            }
+        });
+
+        return {
+            x: solveLinearSystem(normal, rightX),
+            y: solveLinearSystem(normal, rightY)
+        };
+    }
+
+    function solveLinearSystem(matrix, values) {
+        const rows = matrix.map((row, index) => row.concat(values[index]));
+        for (let column = 0; column < 3; column += 1) {
+            let pivot = column;
+            for (let row = column + 1; row < 3; row += 1) {
+                if (Math.abs(rows[row][column]) > Math.abs(rows[pivot][column])) {
+                    pivot = row;
+                }
+            }
+            if (Math.abs(rows[pivot][column]) < 1e-8) {
+                throw new Error("the calibration points did not provide enough gaze variation.");
+            }
+            [rows[column], rows[pivot]] = [rows[pivot], rows[column]];
+            const divisor = rows[column][column];
+            for (let item = column; item < 4; item += 1) {
+                rows[column][item] /= divisor;
+            }
+            for (let row = 0; row < 3; row += 1) {
+                if (row === column) {
+                    continue;
+                }
+                const factor = rows[row][column];
+                for (let item = column; item < 4; item += 1) {
+                    rows[row][item] -= factor * rows[column][item];
+                }
+            }
+        }
+        return rows.map((row) => row[3]);
+    }
+
+    function getCalibratedGazePosition() {
+        if (!gazeCalibration || !latestEyePosition) {
+            return null;
+        }
+        const vector = [latestEyePosition.x, latestEyePosition.y, 1];
+        return {
+            x: Math.max(0, Math.min(0.9999, gazeCalibration.x.reduce((sum, value, index) => sum + value * vector[index], 0))),
+            y: Math.max(0, Math.min(0.9999, gazeCalibration.y.reduce((sum, value, index) => sum + value * vector[index], 0)))
+        };
+    }
+
+    function updateDwellSelection() {
+        const position = getCalibratedGazePosition();
+        const progress = document.getElementById("dwellProgressFill");
+        const status = document.getElementById("dwellStatus");
+        if (!position || !latestFaceLandmarks) {
+            dwellCandidateCell = null;
+            dwellStartedAt = 0;
+            progress.style.width = "0";
+            document.querySelectorAll(".message-board button").forEach((button) => {
+                button.classList.remove("gaze-highlight");
+            });
+            if (gazeCalibration) {
+                status.innerText = "No eyes detected; gaze selection paused.";
+            }
+            return;
+        }
+
+        const column = Math.min(2, Math.floor(position.x * 3));
+        const row = Math.min(2, Math.floor(position.y * 3));
+        const cell = row * 3 + column;
+        document.querySelectorAll(".message-board button").forEach((button) => {
+            button.classList.toggle("gaze-highlight", Number(button.dataset.cell) === cell);
+        });
+
+        if (cell === dwellSelectedCell) {
+            progress.style.width = "100%";
+            return;
+        }
+        if (cell !== dwellCandidateCell) {
+            dwellCandidateCell = cell;
+            dwellStartedAt = performance.now();
+            progress.style.width = "0";
+            status.innerText = "Hold gaze on " + gazeMessageChoices[cell].label + " to select.";
+            return;
+        }
+
+        const progressPercent = Math.min(100, ((performance.now() - dwellStartedAt) / dwellDurationMs) * 100);
+        progress.style.width = progressPercent + "%";
+        if (progressPercent >= 100) {
+            dwellSelectedCell = cell;
+            progress.style.width = "100%";
+            selectGazeMessage(cell);
+        }
+    }
+
+    function selectGazeMessage(index) {
+        const choice = gazeMessageChoices[index];
+        const messageInput = document.getElementById("patientMsg");
+        if (choice.action === "space") {
+            messageInput.value += messageInput.value && !messageInput.value.endsWith(" ") ? " " : "";
+            document.getElementById("calibrationStatus").innerText =
+                "Space added. Continue selecting message choices.";
+            return;
+        }
+        if (choice.action === "send") {
+            if (!messageInput.value.trim()) {
+                document.getElementById("calibrationStatus").innerText =
+                    "Choose a message before selecting Send message.";
+                return;
+            }
+            document.getElementById("calibrationStatus").innerText =
+                "Encrypting and sending the selected message to Firebase...";
+                return encryptAndSave();
+        }
+
+        const separator = messageInput.value && !messageInput.value.endsWith(" ") ? " " : "";
+        messageInput.value += separator + choice.message;
+        document.getElementById("calibrationStatus").innerText =
+            "Selected: " + choice.message + ". Select more choices or Send message.";
+    }
 
     function drawPixelatedVideo(source, context, canvas) {
         const sourceWidth = source.videoWidth;
@@ -304,6 +605,7 @@
                     "Eye detection: face and iris landmarks detected (local estimate)";
             } else {
                 latestFaceLandmarks = null;
+                latestEyePosition = null;
                 document.getElementById("eyeDetectionStatus").innerText =
                     faceLandmarks
                         ? "Eye detection: face found, but iris landmarks are unavailable"
@@ -392,6 +694,7 @@
 
         const averageX = visibleEyes.reduce((sum, eye) => sum + eye.x, 0) / visibleEyes.length;
         const averageY = visibleEyes.reduce((sum, eye) => sum + eye.y, 0) / visibleEyes.length;
+        latestEyePosition = { x: averageX, y: averageY };
         const targetX = Math.max(0, Math.min(1, averageX)) * 320;
         const targetY = Math.max(0, Math.min(1, averageY)) * 240;
         currentX += (targetX - currentX) * 0.25;
@@ -432,6 +735,7 @@
         function renderFrame(timestamp) {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             drawPixelatedVideo(videoElement, ctx, canvas);
+            updateDwellSelection();
 
             if (
                 faceMeshReady &&
